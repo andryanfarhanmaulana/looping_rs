@@ -1,364 +1,399 @@
 import asyncio
-import hashlib
-import json
 import logging
 import random
-import time
-from typing import List, Dict, Optional, Any, Tuple
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
-# Cryptography for signing and verification, essential for blockchain security
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import hashes
-from cryptography.exceptions import InvalidSignature
+from web3 import Web3
+from web3.contract import Contract
+from web3.exceptions import BlockNotFound
+from web3.providers.async_http_provider import AsyncHTTPProvider
+from web3.types import LogReceipt, BlockData
 
-# Faker for generating more realistic-looking test data
-from faker import Faker
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+# В реальном приложении эти данные должны загружаться из защищенного хранилища
+# или переменных окружения, а не храниться в коде.
 
-# --- Simulation Configuration ---
-SIMULATION_CONFIG = {
-    "NUM_VALIDATORS": 4,
-    "BLOCK_TIME_SECONDS": 5,  # Time slot for each block proposer
-    "TRANSACTIONS_PER_SECOND": 2,
-    "MAX_TX_PER_BLOCK": 10,
-    "SIMULATION_DURATION_BLOCKS": 20,
-    "NETWORK_LATENCY_MS": (50, 200) # Min/Max simulated network latency
+@dataclass
+class ChainConfig:
+    name: str
+    rpc_url: str
+    bridge_contract_address: str
+    confirmation_blocks: int = 3
+
+CONFIG = {
+    "source_chain": ChainConfig(
+        name="Ethereum",
+        rpc_url="https://rpc.ankr.com/eth", # Используем публичный RPC Ankr
+        bridge_contract_address="0x9999999999999999999999999999999999999999", # Placeholder
+        confirmation_blocks=5,
+    ),
+    "target_chain": ChainConfig(
+        name="Polygon",
+        rpc_url="https://rpc.ankr.com/polygon", # Используем публичный RPC Ankr
+        bridge_contract_address="0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", # Placeholder
+        confirmation_blocks=10,
+    ),
+    "poll_interval_seconds": 10,
 }
 
-# --- Logging Setup ---
+# Упрощенные ABI для событий моста. В реальном проекте здесь будет полный ABI контракта.
+DUMMY_BRIDGE_ABI = [ 
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "internalType": "bytes32", "name": "transactionId", "type": "bytes32"},
+            {"indexed": True, "internalType": "address", "name": "sender", "type": "address"},
+            {"indexed": False, "internalType": "uint256", "name": "amount", "type": "uint256"},
+            {"indexed": False, "internalType": "string", "name": "targetChain", "type": "string"}
+        ],
+        "name": "TokensLocked",
+        "type": "event"
+    },
+    {
+        "anonymous": False,
+        "inputs": [
+            {"indexed": True, "internalType": "bytes32", "name": "transactionId", "type": "bytes32"},
+            {"indexed": True, "internalType": "address", "name": "recipient", "type": "address"}
+        ],
+        "name": "TokensUnlocked",
+        "type": "event"
+    }
+]
+
+# ==============================================================================
+# LOGGING SETUP
+# ==============================================================================
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [%(name)s] - %(message)s',
+    format='%(asctime)s - %(levelname)s:%(name)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-logger = logging.getLogger("PoS_Simulator")
-fake = Faker()
+# ==============================================================================
+# CUSTOM EXCEPTIONS
+# ==============================================================================
 
-# --- Cryptography Utilities ---
+class ConnectionError(Exception):
+    "Исключение при ошибке подключения к RPC ноде."
+    pass
 
-def generate_key_pair() -> Tuple[ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicKey]:
-    """Generates an ECDSA private and public key pair."""
-    private_key = ec.generate_private_key(ec.SECP256R1())
-    public_key = private_key.public_key()
-    return private_key, public_key
+class ConfigurationError(Exception):
+    "Исключение при некорректной конфигурации."
+    pass
 
-def get_address_from_public_key(public_key: ec.EllipticCurvePublicKey) -> str:
-    """Creates a human-readable address from a public key (simplified)."""
-    key_bytes = public_key.public_numbers().x.to_bytes(32, 'big') + \
-                public_key.public_numbers().y.to_bytes(32, 'big')
-    return '0x' + hashlib.sha256(key_bytes).hexdigest()[-40:]
-
-# --- Core Data Structures ---
+# ==============================================================================
+# CORE ARCHITECTURE CLASSES
+# ==============================================================================
 
 @dataclass
-class Transaction:
-    """Represents a single transaction in the system."""
-    sender: str
-    receiver: str
-    amount: float
-    nonce: int
-    signature: Optional[str] = None
+class CrossChainTransaction:
+    "Структура для хранения данных о кросс-чейн транзакции."
+    tx_id: str
+    status: str = "PENDING" # PENDING, COMPLETED, FAILED
+    source_chain: str = ""
+    target_chain: str = ""
+    user: str = ""
+    amount: float = 0.0
+    lock_event_details: Dict[str, Any] = field(default_factory=dict)
+    unlock_event_details: Optional[Dict[str, Any]] = None
 
-    def to_dict_for_signing(self) -> Dict[str, Any]:
-        """Returns the transaction data as a dict for signing (without the signature)."""
-        return {"sender": self.sender, "receiver": self.receiver, "amount": self.amount, "nonce": self.nonce}
+class EventProcessor:
+    "Централизованный обработчик событий, управляющий состоянием транзакций."
 
-    def get_hash(self) -> bytes:
-        """Calculates the hash of the transaction data."""
-        tx_string = json.dumps(self.to_dict_for_signing(), sort_keys=True).encode('utf-8')
-        return hashlib.sha256(tx_string).digest()
+    def __init__(self):
+        # В реальной системе здесь была бы база данных (например, Redis или PostgreSQL).
+        # Для симуляции используем словарь в памяти.
+        self.transactions: Dict[str, CrossChainTransaction] = {}
+        self._lock = asyncio.Lock()
+        self.logger = logging.getLogger(self.__class__.__name__)
 
-    def sign(self, private_key: ec.EllipticCurvePrivateKey):
-        """Signs the transaction with the sender's private key."""
-        signature_bytes = private_key.sign(self.get_hash(), ec.ECDSA(hashes.SHA256()))
-        self.signature = signature_bytes.hex()
+    async def process_lock_event(self, event: LogReceipt, chain_name: str):
+        "Обрабатывает событие 'TokensLocked' с исходной цепи."
+        args = event['args']
+        tx_id = args['transactionId'].hex()
 
-    def is_valid(self, public_key: ec.EllipticCurvePublicKey) -> bool:
-        """Verifies the transaction's signature."""
-        if not self.signature:
-            return False
+        async with self._lock:
+            if tx_id in self.transactions:
+                self.logger.warning(f"Дублирующееся событие Lock для tx_id: {tx_id}. Игнорируем.")
+                return
+
+            # Предполагаем, что amount в 'wei', конвертируем в 'ether' для читаемости
+            amount_readable = args['amount'] / (10**18)
+
+            tx = CrossChainTransaction(
+                tx_id=tx_id,
+                source_chain=chain_name,
+                target_chain=args['targetChain'],
+                user=args['sender'],
+                amount=amount_readable,
+                lock_event_details={
+                    'blockNumber': event['blockNumber'],
+                    'transactionHash': event['transactionHash'].hex(),
+                }
+            )
+            self.transactions[tx_id] = tx
+            self.logger.info(
+                f"РЕГИСТРАЦИЯ БЛОКИРОВКИ: TxID [{tx_id[:10]}...] | Пользователь [{tx.user}] | "
+                f"Сумма [{tx.amount:.4f}] | Из [{tx.source_chain}] -> В [{tx.target_chain}]. Статус: PENDING."
+            )
+
+    async def process_unlock_event(self, event: LogReceipt):
+        "Обрабатывает событие 'TokensUnlocked' с целевой цепи."
+        args = event['args']
+        tx_id = args['transactionId'].hex()
+
+        async with self._lock:
+            if tx_id not in self.transactions:
+                self.logger.warning(
+                    f"Получено событие Unlock для неизвестной транзакции (tx_id: {tx_id}). "
+                    f"Возможно, событие Lock еще не обработано или произошло ранее."
+                )
+                return
+            
+            tx = self.transactions[tx_id]
+            if tx.status == "COMPLETED":
+                self.logger.warning(f"Дублирующееся событие Unlock для tx_id: {tx_id}. Игнорируем.")
+                return
+
+            tx.status = "COMPLETED"
+            tx.unlock_event_details = {
+                'blockNumber': event['blockNumber'],
+                'transactionHash': event['transactionHash'].hex(),
+            }
+            self.logger.info(
+                f"ПОДТВЕРЖДЕНИЕ РАЗБЛОКИРОВКИ: TxID [{tx_id[:10]}...] | Статус изменен на COMPLETED."
+            )
+
+    def log_state_summary(self):
+        "Выводит сводку по текущему состоянию транзакций."
+        pending = sum(1 for tx in self.transactions.values() if tx.status == 'PENDING')
+        completed = sum(1 for tx in self.transactions.values() if tx.status == 'COMPLETED')
+        self.logger.info(f"Сводка состояния: PENDING: {pending}, COMPLETED: {completed}")
+
+
+class EVMChainConnector:
+    "Обеспечивает подключение к EVM-совместимой сети через Web3.py."
+
+    def __init__(self, config: ChainConfig):
+        self.config = config
+        self.logger = logging.getLogger(f"{self.config.name}Connector")
+        self.web3: Optional[Web3] = None
+        self.bridge_contract: Optional[Contract] = None
+
+    async def connect(self):
+        "Устанавливает асинхронное соединение с RPC-узлом."
+        self.logger.info(f"Подключение к {self.config.name} через {self.config.rpc_url}...")
         try:
-            signature_bytes = bytes.fromhex(self.signature)
-            public_key.verify(signature_bytes, self.get_hash(), ec.ECDSA(hashes.SHA256()))
-            return True
-        except (InvalidSignature, ValueError):
-            return False
+            provider = AsyncHTTPProvider(self.config.rpc_url)
+            self.web3 = Web3(provider)
+            if not await self.web3.is_connected():
+                raise ConnectionError(f"Не удалось подключиться к {self.config.name}.")
+            
+            self.bridge_contract = self.web3.eth.contract(
+                address=Web3.to_checksum_address(self.config.bridge_contract_address),
+                abi=DUMMY_BRIDGE_ABI
+            )
+            self.logger.info(f"Успешное подключение к {self.config.name}. ChainID: {await self.web3.eth.chain_id}")
+        except Exception as e:
+            self.logger.error(f"Ошибка при подключении к {self.config.name}: {e}")
+            raise ConnectionError from e
 
-@dataclass
-class Block:
-    """Represents a block in the blockchain."""
-    height: int
-    timestamp: float
-    transactions: List[Transaction]
-    previous_hash: str
-    validator_address: str
-    signature: Optional[str] = None
+    async def get_latest_block_number(self) -> int:
+        "Возвращает номер последнего блока."
+        if not self.web3:
+            raise ConnectionError("Соединение не установлено.")
+        return await self.web3.eth.block_number
 
-    def to_dict_for_signing(self) -> Dict[str, Any]:
-        """Returns the block data as a dict for signing (without the signature)."""
-        return {
-            "height": self.height,
-            "timestamp": self.timestamp,
-            "transactions": [tx.__dict__ for tx in self.transactions],
-            "previous_hash": self.previous_hash,
-            "validator_address": self.validator_address
-        }
 
-    def calculate_hash(self) -> str:
-        """Calculates the SHA256 hash of the block."""
-        block_string = json.dumps(self.to_dict_for_signing(), sort_keys=True).encode('utf-8')
-        return hashlib.sha256(block_string).hexdigest()
+class ChainEventListener:
+    "Слушатель событий для одной блокчейн-цепочки."
 
-    def sign(self, private_key: ec.EllipticCurvePrivateKey):
-        """Signs the block hash with the validator's private key."""
-        block_hash_bytes = bytes.fromhex(self.calculate_hash())
-        signature_bytes = private_key.sign(block_hash_bytes, ec.ECDSA(hashes.SHA256()))
-        self.signature = signature_bytes.hex()
+    def __init__(self, chain_config: ChainConfig, event_processor: EventProcessor, is_source_chain: bool):
+        self.config = chain_config
+        self.connector = EVMChainConnector(chain_config)
+        self.processor = event_processor
+        self.is_source_chain = is_source_chain
+        self.logger = logging.getLogger(f"{self.config.name}Listener")
+        self._last_processed_block = 0
 
-# --- Core System Components ---
+    async def _initialize_start_block(self):
+        "Инициализирует начальный блок для сканирования."
+        try:
+            latest_block = await self.connector.get_latest_block_number()
+            # Начинаем сканирование с небольшим отставанием, чтобы избежать проблем с reorg
+            self._last_processed_block = latest_block - self.config.confirmation_blocks
+            self.logger.info(
+                f"Инициализация слушателя для {self.config.name}. "
+                f"Начальный блок: {self._last_processed_block} (Последний: {latest_block})"
+            )
+        except ConnectionError as e:
+            self.logger.error(f"Не удалось получить начальный блок для {self.config.name}: {e}")
+            raise
 
-class Mempool:
-    """Manages a pool of unconfirmed transactions for a validator."""
-    def __init__(self):
-        self.pending_transactions: Dict[str, Transaction] = {}
+    async def _scan_block_range(self, from_block: int, to_block: int):
+        "Сканирует диапазон блоков на наличие целевых событий."
+        if not self.connector.web3 or not self.connector.bridge_contract:
+            self.logger.error("Коннектор или контракт не инициализирован.")
+            return
 
-    def add_transaction(self, transaction: Transaction) -> bool:
-        """Adds a transaction to the mempool if it's not already present."""
-        tx_hash = transaction.get_hash().hex()
-        if tx_hash not in self.pending_transactions:
-            self.pending_transactions[tx_hash] = transaction
-            return True
-        return False
-
-    def get_transactions_for_block(self, max_tx: int) -> List[Transaction]:
-        """Retrieves a batch of transactions to be included in a new block."""
-        # Simple FIFO selection
-        tx_hashes = list(self.pending_transactions.keys())
-        selected_hashes = tx_hashes[:max_tx]
-        return [self.pending_transactions[h] for h in selected_hashes]
-
-    def remove_transactions(self, transactions: List[Transaction]):
-        """Removes transactions that have been included in a block."""
-        for tx in transactions:
-            tx_hash = tx.get_hash().hex()
-            if tx_hash in self.pending_transactions:
-                del self.pending_transactions[tx_hash]
-
-class Blockchain:
-    """Manages the state of the blockchain for a single validator."""
-    def __init__(self, genesis_block: Block):
-        self.chain: List[Block] = [genesis_block]
-
-    def get_latest_block(self) -> Block:
-        """Returns the most recent block in the chain."""
-        return self.chain[-1]
-
-    def add_block(self, block: Block) -> bool:
-        """Adds a new block to the chain after validation."""
-        latest_block = self.get_latest_block()
-        # Basic validation: height and previous hash
-        if block.height != latest_block.height + 1:
-            logger.warning(f"Invalid block height: expected {latest_block.height + 1}, got {block.height}")
-            return False
-        if block.previous_hash != latest_block.calculate_hash():
-            logger.warning(f"Invalid previous hash for block {block.height}")
-            return False
-        
-        self.chain.append(block)
-        return True
-
-class P2PNetworkSimulator:
-    """Simulates a basic P2P network for broadcasting events."""
-    def __init__(self):
-        self.nodes: List['Validator'] = []
-
-    def register_node(self, node: 'Validator'):
-        """Adds a new validator node to the network."""
-        self.nodes.append(node)
-
-    async def broadcast_block(self, block: Block, origin_node_address: str):
-        """Broadcasts a new block to all other nodes with simulated latency."""
-        logger.info(f"Node {origin_node_address[:10]}... broadcasting block {block.height}")
-        for node in self.nodes:
-            if node.address != origin_node_address:
-                latency = random.uniform(*SIMULATION_CONFIG['NETWORK_LATENCY_MS']) / 1000.0
-                await asyncio.sleep(latency)
-                await node.event_queue.put(("new_block", block))
-    
-    async def broadcast_transaction(self, tx: Transaction):
-        """Broadcasts a new transaction to all nodes."""
-        for node in self.nodes:
-            latency = random.uniform(*SIMULATION_CONFIG['NETWORK_LATENCY_MS']) / 1000.0
-            await asyncio.sleep(latency)
-            await node.event_queue.put(("new_transaction", tx))
-
-class Validator:
-    """Represents a validator node in the PoS network."""
-    def __init__(self, network: P2PNetworkSimulator, genesis_block: Block):
-        self.private_key, self.public_key = generate_key_pair()
-        self.address = get_address_from_public_key(self.public_key)
-        self.mempool = Mempool()
-        self.blockchain = Blockchain(genesis_block)
-        self.network = network
-        self.event_queue = asyncio.Queue()
-        self.logger = logging.getLogger(f"Validator-{self.address[:10]}")
-        self.logger.info(f"Initialized with address {self.address}")
-
-    def _is_my_turn(self, current_proposer_index: int, all_validators: List['Validator']) -> bool:
-        """Checks if it is this validator's turn to propose a block (Round-Robin)."""
-        return all_validators[current_proposer_index] == self
-
-    def create_block(self) -> Optional[Block]:
-        """Creates a new block from transactions in the mempool."""
-        latest_block = self.blockchain.get_latest_block()
-        transactions_to_include = self.mempool.get_transactions_for_block(SIMULATION_CONFIG['MAX_TX_PER_BLOCK'])
-        
-        # Edge case: Don't create an empty block if no transactions are available
-        # In a real network, empty blocks might be allowed to maintain block time.
-        if not transactions_to_include:
-            self.logger.info("Mempool is empty, skipping block creation.")
-            return None
-
-        new_block = Block(
-            height=latest_block.height + 1,
-            timestamp=time.time(),
-            transactions=transactions_to_include,
-            previous_hash=latest_block.calculate_hash(),
-            validator_address=self.address
+        event_name = 'TokensLocked' if self.is_source_chain else 'TokensUnlocked'
+        event_filter = self.connector.bridge_contract.events[event_name].create_filter(
+            fromBlock=from_block,
+            toBlock=to_block
         )
-        new_block.sign(self.private_key)
-        self.logger.info(f"Created and signed new block {new_block.height} with {len(new_block.transactions)} transactions.")
-        return new_block
 
-    def validate_and_process_block(self, block: Block, proposer_public_key: ec.EllipticCurvePublicKey) -> bool:
-        """Performs a full validation of a received block."""
-        # 1. Verify the block's own signature
-        calculated_hash_bytes = bytes.fromhex(block.calculate_hash())
         try:
-            signature_bytes = bytes.fromhex(block.signature)
-            proposer_public_key.verify(signature_bytes, calculated_hash_bytes, ec.ECDSA(hashes.SHA256()))
-        except (InvalidSignature, ValueError):
-            self.logger.warning(f"Block {block.height} has an invalid signature from validator {block.validator_address[:10]}...")
-            return False
-        
-        # 2. Add block to local chain (checks height and prev_hash)
-        if not self.blockchain.add_block(block):
-            self.logger.warning(f"Failed to add block {block.height} to local chain.")
-            return False
-        
-        # 3. If successfully added, remove its transactions from our mempool
-        self.mempool.remove_transactions(block.transactions)
-        self.logger.info(f"Validated and added block {block.height}. Chain height is now {self.blockchain.get_latest_block().height}.")
-        return True
+            events = await event_filter.get_all_entries()
+            if events:
+                self.logger.info(f"Найдено {len(events)} '{event_name}' событий в блоках {from_block}-{to_block}.")
+                for event in events:
+                    if self.is_source_chain:
+                        await self.processor.process_lock_event(event, self.config.name)
+                    else:
+                        await self.processor.process_unlock_event(event)
+        except BlockNotFound:
+             self.logger.warning(f"Блоки в диапазоне {from_block}-{to_block} не найдены. Возможно, произошел reorg.")
+             # В этом случае мы можем откатить _last_processed_block, но для симуляции пропустим
+        except Exception as e:
+            self.logger.error(f"Ошибка при сканировании событий в блоках {from_block}-{to_block}: {e}")
 
-    async def process_events(self, all_validators: List['Validator']):
-        """The main loop for processing events from the queue."""
+    async def run(self):
+        "Основной цикл работы слушателя."
+        await self.connector.connect()
+        await self._initialize_start_block()
+
         while True:
-            event_type, data = await self.event_queue.get()
-            if event_type == "new_transaction":
-                if self.mempool.add_transaction(data):
-                    self.logger.debug(f"Added new tx to mempool. Current size: {len(self.mempool.pending_transactions)}")
-            
-            elif event_type == "new_block":
-                block: Block = data
-                proposer_address = block.validator_address
-                proposer = next((v for v in all_validators if v.address == proposer_address), None)
-                if not proposer:
-                    self.logger.warning(f"Received block from unknown validator {proposer_address}")
-                    continue
+            try:
+                latest_block = await self.connector.get_latest_block_number()
                 
-                # Avoid processing our own block broadcast back to us
-                if self.address == proposer_address:
-                    continue
+                # Определяем конечный блок для сканирования с учетом подтверждений
+                to_block = latest_block - self.config.confirmation_blocks
+
+                if to_block > self._last_processed_block:
+                    from_block = self._last_processed_block + 1
+                    self.logger.debug(f"Сканируем блоки с {from_block} по {to_block} на {self.config.name}")
+                    await self._scan_block_range(from_block, to_block)
+                    self._last_processed_block = to_block
+                else:
+                    self.logger.debug(f"Нет новых подтвержденных блоков на {self.config.name}. Последний: {self._last_processed_block}")
                 
-                self.logger.info(f"Received block {block.height} from {proposer_address[:10]}...")
-                self.validate_and_process_block(block, proposer.public_key)
-            
-            self.event_queue.task_done()
+                await asyncio.sleep(CONFIG["poll_interval_seconds"])
 
-# --- Simulation Driver ---
+            except ConnectionError as e:
+                self.logger.error(f"Ошибка соединения с {self.config.name}: {e}. Попытка переподключения через 30 секунд.")
+                await asyncio.sleep(30)
+                try:
+                    await self.connector.connect()
+                except ConnectionError:
+                    self.logger.error("Переподключение не удалось.")
+            except Exception as e:
+                self.logger.critical(f"Критическая ошибка в цикле слушателя {self.config.name}: {e}", exc_info=True)
+                await asyncio.sleep(60) # Пауза перед следующей попыткой
 
-async def transaction_generator(network: P2PNetworkSimulator, validators: List[Validator]):
-    """A coroutine that continuously generates and broadcasts transactions."""
-    nonce_map = {v.address: 0 for v in validators}
-    while True:
-        sender_validator = random.choice(validators)
-        receiver_validator = random.choice([v for v in validators if v != sender_validator])
+
+class CrossChainOrchestrator:
+    "Оркестратор, который запускает и координирует слушателей для обеих сетей."
+
+    def __init__(self):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.event_processor = EventProcessor()
         
-        tx = Transaction(
-            sender=sender_validator.address,
-            receiver=receiver_validator.address,
-            amount=round(random.uniform(0.1, 10.0), 4),
-            nonce=nonce_map[sender_validator.address]
+        self.source_chain_listener = ChainEventListener(
+            chain_config=CONFIG["source_chain"],
+            event_processor=self.event_processor,
+            is_source_chain=True
         )
-        tx.sign(sender_validator.private_key)
-        nonce_map[sender_validator.address] += 1
+        self.target_chain_listener = ChainEventListener(
+            chain_config=CONFIG["target_chain"],
+            event_processor=self.event_processor,
+            is_source_chain=False
+        )
+        self.tasks: List[asyncio.Task] = []
 
-        await network.broadcast_transaction(tx)
-        
-        await asyncio.sleep(1.0 / SIMULATION_CONFIG['TRANSACTIONS_PER_SECOND'])
+    async def _run_state_logger(self):
+        "Периодически выводит сводку о состоянии транзакций."
+        while True:
+            await asyncio.sleep(60)
+            self.event_processor.log_state_summary()
+    
+    async def _simulate_events(self):
+        "Симулирует возникновение событий для демонстрации работы."
+        await asyncio.sleep(20) # Начальная задержка
+        self.logger.info("--- СИМУЛЯЦИЯ: Начало генерации событий ---")
+        while True:
+            await asyncio.sleep(random.uniform(15, 45))
+            # Симулируем событие блокировки
+            tx_id = '0x' + random.randbytes(32).hex()
+            mock_lock_event = {
+                'args': {
+                    'transactionId': bytes.fromhex(tx_id[2:]),
+                    'sender': '0x' + random.randbytes(20).hex(),
+                    'amount': random.randint(1, 1000) * (10**18),
+                    'targetChain': self.target_chain_listener.config.name
+                },
+                'blockNumber': 1, # Placeholder
+                'transactionHash': ('0x' + random.randbytes(32).hex()).encode()
+            }
+            await self.event_processor.process_lock_event(mock_lock_event, self.source_chain_listener.config.name)
 
-
-async def main():
-    """Main function to set up and run the PoS simulation."""
-    logger.info("--- Starting Proof-of-Stake Validator Simulation ---")
-    
-    # 1. Setup network and genesis block
-    network = P2PNetworkSimulator()
-    genesis_block = Block(
-        height=0,
-        timestamp=time.time(),
-        transactions=[],
-        previous_hash="0"*64,
-        validator_address="SYSTEM_GENESIS"
-    )
-    
-    # 2. Create validators and register them with the network
-    validators = [Validator(network, genesis_block) for _ in range(SIMULATION_CONFIG['NUM_VALIDATORS'])]
-    for v in validators:
-        network.register_node(v)
-    
-    # 3. Start event processing and transaction generation tasks for each validator
-    for v in validators:
-        asyncio.create_task(v.process_events(validators))
-    
-    asyncio.create_task(transaction_generator(network, validators))
-    
-    # 4. Main simulation loop (block production cycle)
-    try:
-        for block_height in range(1, SIMULATION_CONFIG['SIMULATION_DURATION_BLOCKS'] + 1):
-            # Determine proposer using Round-Robin for simplicity
-            proposer_index = (block_height - 1) % len(validators)
-            proposer = validators[proposer_index]
-            
-            logger.info(f"\n--- Block Slot {block_height} | Proposer: {proposer.address[:10]}... ---")
-            
-            # Wait for block time
-            await asyncio.sleep(SIMULATION_CONFIG['BLOCK_TIME_SECONDS'])
-            
-            # Proposer creates and broadcasts a block
-            new_block = proposer.create_block()
-            if new_block:
-                # In a real network, the proposer would also add it to its own chain
-                proposer.blockchain.add_block(new_block)
-                proposer.mempool.remove_transactions(new_block.transactions)
-                
-                await network.broadcast_block(new_block, proposer.address)
+            # Симулируем событие разблокировки с задержкой
+            if random.random() > 0.1: # 90% шанс на успешную разблокировку
+                await asyncio.sleep(random.uniform(5, 20))
+                mock_unlock_event = {
+                    'args': {
+                        'transactionId': bytes.fromhex(tx_id[2:]),
+                        'recipient': '0x' + random.randbytes(20).hex()
+                    },
+                    'blockNumber': 2, # Placeholder
+                    'transactionHash': ('0x' + random.randbytes(32).hex()).encode()
+                }
+                await self.event_processor.process_unlock_event(mock_unlock_event)
             else:
-                 logger.info(f"Proposer {proposer.address[:10]}... did not create a block.")
+                 self.logger.warning(f"СИМУЛЯЦИЯ: Транзакция {tx_id[:10]}... 'зависла' и не была разблокирована.")
 
-    except asyncio.CancelledError:
-        logger.info("Simulation cancelled.")
+    async def start(self):
+        "Запускает все компоненты системы."
+        self.logger.info("Запуск оркестратора Cross-Chain Bridge Listener...")
+        try:
+            self.tasks.append(asyncio.create_task(self.source_chain_listener.run()))
+            self.tasks.append(asyncio.create_task(self.target_chain_listener.run()))
+            self.tasks.append(asyncio.create_task(self._run_state_logger()))
+            self.tasks.append(asyncio.create_task(self._simulate_events()))
+
+            await asyncio.gather(*self.tasks)
+
+        except asyncio.CancelledError:
+            self.logger.info("Получен сигнал отмены. Завершение работы...")
+        finally:
+            for task in self.tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+            self.logger.info("Оркестратор успешно остановлен.")
+
+
+def main():
+    orchestrator = CrossChainOrchestrator()
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(orchestrator.start())
+    except KeyboardInterrupt:
+        print("\nПолучен сигнал KeyboardInterrupt. Начинаю graceful shutdown...")
+        # Graceful shutdown инициируется через отмену основной задачи
+        tasks = asyncio.all_tasks(loop=loop)
+        for t in tasks:
+            t.cancel()
+        
+        # Даем время на завершение задач
+        loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
     finally:
-        logger.info("--- Simulation Finished ---")
-        # Final check of chain states
-        for v in validators:
-            logger.info(f"Validator {v.address[:10]}... ended with chain height: {v.blockchain.get_latest_block().height}")
+        loop.close()
+        logging.info("Цикл событий завершен.")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("\nSimulation stopped by user.")
-
+    main()
